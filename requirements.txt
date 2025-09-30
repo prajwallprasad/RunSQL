@@ -1,2 +1,6 @@
 pandas
 -e .
+numpy 
+fastapi
+uvicorn
+mysql-connector-python
