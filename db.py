@@ -126,6 +126,7 @@ from mysql.connector import Error
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 from logger import logging
+from datetime import datetime
 
 # ------------------------
 # 1. Database connection
@@ -144,17 +145,17 @@ def get_connection():
         return None
 
 # ------------------------
-# 2. Log execution status
+# 2. Log execution status with timing
 # ------------------------
-def log_status(source_id, request, status, output):
+def log_status(source_id, request, status, output, start_time=None, end_time=None, execution_time=None):
     conn = get_connection()
     if not conn:
         return
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO SQLStoreStatus (source, request, status, output)
-        VALUES (%s, %s, %s, %s)
-    """, (source_id, request, status, str(output)))
+        INSERT INTO SQLStoreStatus (source, request, status, output, start_time, end_time, execution_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (source_id, request, status, str(output), start_time, end_time, execution_time))
     conn.commit()
     conn.close()
 
@@ -174,6 +175,7 @@ def execute_query_by_id(query_id):
         return {"error": f"No query found with id {query_id}"}
     
     sql = query_row["description"]
+    start_time = datetime.now()
 
     try:
         cursor.execute(sql)
@@ -183,14 +185,19 @@ def execute_query_by_id(query_id):
             conn.commit()
             result = {"rows_affected": cursor.rowcount}
 
-        log_status(query_id, f"POST /start/{query_id}", "Success", result)
+        end_time = datetime.now()
+        execution_time = (end_time - start_time).total_seconds()
+
+        log_status(query_id, f"POST /start/{query_id}", "Success", result, start_time, end_time, execution_time)
         conn.close()
-        return {"id": query_id, "status": "Success", "output": result}
+        return {"id": query_id, "status": "Success", "output": result, "execution_time": execution_time}
 
     except Error as e:
-        log_status(query_id, f"POST /start/{query_id}", "Failed", str(e))
+        end_time = datetime.now()
+        execution_time = (end_time - start_time).total_seconds()
+        log_status(query_id, f"POST /start/{query_id}", "Failed", str(e), start_time, end_time, execution_time)
         conn.close()
-        return {"id": query_id, "status": "Failed", "error": str(e)}
+        return {"id": query_id, "status": "Failed", "error": str(e), "execution_time": execution_time}
 
 # ------------------------
 # 4. Get latest execution status
@@ -239,7 +246,9 @@ def run_queries_multithreaded(query_ids, max_workers=10):
 # 7. Batch execution - multiprocessing
 # ------------------------
 def run_queries_multiprocessed(query_ids, processes=4):
-    with Pool(processes=processes) as pool:
+    from multiprocessing import get_context
+    ctx = get_context("spawn")  # safer on Windows
+    with ctx.Pool(processes=processes) as pool:
         results = pool.map(execute_query_by_id, query_ids)
     return results
 
@@ -260,15 +269,12 @@ def run_queries_hybrid(query_ids, num_processes=4, threads_per_process=5):
     for i, qid in enumerate(remaining):
         chunks[i % num_processes].append(qid)
 
-    if __name__ == "__main__":
-        with multiprocessing.Pool(processes=num_processes) as pool:
-            results = pool.map(run_chunk, chunks)
-    else:
-        # Fallback if called from FastAPI (Windows may require spawn method)
-        results = []
-        for chunk in chunks:
-            results.extend(run_queries_multithreaded(chunk, threads_per_process))
-
+    # Use spawn context for Windows compatibility
+    ctx = multiprocessing.get_context("spawn")
+    results = []
+    with ctx.Pool(processes=num_processes) as pool:
+        chunk_results = pool.map(run_chunk, chunks)
     # Flatten results
-    flat_results = [item for sublist in results for item in sublist]
-    return flat_results
+    for sublist in chunk_results:
+        results.extend(sublist)
+    return results
